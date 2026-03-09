@@ -24,25 +24,106 @@ class Core:               #核心系统
             pass
 class Combat:             #战斗系统
     class Harm:           #伤害系统
-        def __init__(self,body_harm_value,armor_harm_value,harm_level_max,harm_type="name"):
-            self.body_harm_value = body_harm_value          #基础身体伤害
-            self.armor_harm_value = armor_harm_value        #基础护甲伤害
-            self.harm_leve_max = harm_level_max   #最大等级
-            self.harm_type = harm_type
-            self.level = 0    #等级初始为零
-            self.events = []  #事件存储列表
-    class HP:             #血量系统
-        def __init__(self,core,max_hp,armor,body_part_config=None,armor_part_config=None,owner_type="character",source_type="name"):
+        def __init__(self,core,harm_config=None):
             self.core = core
             self.config = core.config
-            self.max_hp = max_hp
-            self.hp = max_hp
-            self.armor = armor
-            self.low_armor = 0
-            self.owner_type = owner_type
-            self.source_type = source_type
-            self.events = []
-            self.treat_log = []
+            self.motion_body_harm = 0               #动态身体伤害，类内储存
+            self.motion_armor_harm = 0              #动态护甲伤害，类内储存
+            self.harm_level = 0                     #等级初始为零
+            self.harm_time = 0                      #伤害时间，类内储存
+            self.level_start_time = None            #伤害等级开始时间
+            self.level_end_time = 0                 #伤害等级超时后的降级时间
+            self.harm_pace = 0                      #伤害频率，类内存储
+            self.harm_type = []                     #伤害类型，类内存储
+            self.events = []                        #事件存储列表
+            self.harm_log = []                      #日志
+            self.harm_dictionary = {}               #输出字典，所有伤害输出值集合到这
+            #伤害系统初始化
+            self.harm_list = []
+            if harm_config is not None:
+                self._init_harm(harm_config)
+        def _init_harm(self,config):
+            for harm in config:
+                harm = {
+                    "name":harm["name"],
+                    "body_harm_value":harm["body_harm_value"],               #基础身体伤害
+                    "armor_harm_value":harm["armor_harm_value"],             #基础护甲伤害
+                    "harm_level_max":harm["harm_level_max"],                 #伤害最大等级
+                    "harm_level_time":harm["harm_level_time"],               #维持等级的时间
+                    "harm_level_end_time":harm["harm_level_end_time"],       #等级超时后的等级持续时间
+                    "harm_level_lose_number":harm["harm_level_lose_number"], #默认每次损失等级数
+                    "harm_pace":harm["harm_pace"],                           #伤害频率，伤害次数
+                    "harm_type":dict(harm["harm_type"])                      #伤害类型，此处为字典
+                }
+                self.harm_list.append(harm)
+        def _get_harm(self,harm_name):                                       #获取单次实例
+            for harm in self.harm_list:
+                if harm["name"] == harm_name:
+                    return  harm
+            return None
+        def _get_harm_attr(self,harm_name,attr_name):                        #方便使用实例内属性
+            harm = self._get_harm(harm_name)
+            if harm is None:
+                return None
+            return harm.get(attr_name,0)
+        def _get_armor_harm_value(self,harm_name):
+            return self._get_harm_attr(harm_name,"armor_harm_value")
+        def _get_body_harm_value(self,harm_name):
+            return self._get_harm_attr(harm_name,"body_harm_value")
+        def _get_harm_pace(self,harm_name):
+            return self._get_harm_attr(harm_name,"harm_pace")
+        def _get_harm_type(self,harm_name):
+            return self._get_harm_attr(harm_name,"harm_type")
+        def _get_harm_level_max(self,harm_name):
+            return self._get_harm_attr(harm_name,"harm_level_max")
+        def _get_harm_level_time(self,harm_name):
+            return self._get_harm_attr(harm_name,"harm_level_time")
+        def _get_harm_level_end_time(self,harm_name):
+            return self._get_harm_attr(harm_name,"harm_level_end_time")
+        def _get_harm_level_lose_number(self,harm_name):
+            return self._get_harm_attr(harm_name,"harm_level_lose_number")
+        def _add_level(self,harm_name,level_event_number):                      #改变等级方法
+            harm_level_max = self._get_harm_level_max(harm_name)
+            self.harm_level = min(self.harm_level + level_event_number,harm_level_max)
+            if self.harm_level < 0:
+                self.harm_level = 0
+            self.level_start_time = time.time()      #重置计时
+        def _get_current_level(self,harm_name):                                 #获取当前等级
+            harm_level_time = self._get_harm_level_time(harm_name)
+            if self.harm_level == 0:
+                return 0
+            elapsed_time = time.time() - self.level_start_time
+            if elapsed_time > harm_level_time:
+                self._lower_level(harm_name)
+                return self._get_current_level(harm_name)
+            return self.harm_level
+        def _lower_level(self,harm_name):                                       #默认降级方法
+            harm_level_end_time = self._get_harm_level_end_time(harm_name)
+            harm_level_lose_number = self._get_harm_level_lose_number(harm_name)
+            if self.harm_level <= 0:
+                return 0
+            elapsed_time = time.time() - self.level_start_time
+            levels_to_lose = int(elapsed_time / harm_level_end_time) * harm_level_lose_number           #默认过一定时间降x级
+            self.harm_level = max(0,self.harm_level - levels_to_lose)
+            if self.harm_level > 0:
+                self.level_start_time = time.time()
+            else:
+                self.level_start_time = None
+            return self.harm_level
+    class HP:             #血量系统
+        def __init__(self,core,max_hp,armor,armor_durability_max,body_part_config=None,armor_part_config=None,owner_type="character",source_type="name"):
+            self.core = core
+            self.config = core.config
+            self.max_hp = max_hp                                 #血量上限
+            self.hp = max_hp                                     #当前血量
+            self.armor = armor                                   #当前护甲
+            self.armor_durability_max = armor_durability_max     #护甲上限
+            self.low_armor = 0                                   #护甲下限
+            self.owner_type = owner_type                         #目标
+            self.source_type = source_type                       #来源
+            self.events = []                                     #事件
+            self.treat_log = []                                  #日志
+            self.HP_dictionary = {}                              #输出字典，所有HP输出值集合到这
             #身体部位初始化
             self.body_part_list = []
             if body_part_config is not None:
@@ -57,7 +138,7 @@ class Combat:             #战斗系统
                     "name":part["name"],
                     "hp_max":part["hp_max"],
                     "hp":part["hp_max"],
-                    "resistance":part["resistance"],      #resistance是字典！
+                    "resistance":dict(part["resistance"]),
                 }
                 self.body_part_list.append(body_part)
         def _init_amor_parts(self,config):
@@ -68,7 +149,7 @@ class Combat:             #战斗系统
                     "durability_lose_speed":part["durability_lose_speed"],      #护甲耐久受到伤害后的消耗速度比率
                     "durability_max":part["durability_max"],
                     "durability":part["durability_max"],
-                    "resistance":part["resistance"],
+                    "resistance":dict(part["resistance"]),
                 }
                 self.armor_part_list.append(armor_part)
         def _get_current_armor(self,harm_part):             #获取当前护甲部位
@@ -85,7 +166,7 @@ class Combat:             #战斗系统
         def _armor_restrain(self,harm,harm_part):                     #计算护甲免伤后的伤害
             armor = self._get_current_armor(harm_part)
             if armor is None:
-                return 0
+                return harm
             pass
         def _get_current_body_part(self,harm_part):         #获取当前身体部位
             for part in self.body_part_list:
@@ -141,6 +222,8 @@ class Entity:             #实体系统
     class AI:             #AI系统
         pass
     class Item:           #物品系统
+        pass
+    class Inventory:      #仓库系统
         pass
 class World:              #世界系统
     class Map:            #地图系统
