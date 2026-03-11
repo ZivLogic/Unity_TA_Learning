@@ -215,8 +215,13 @@ class Combat:             #战斗系统
             self.max_hp = max_hp                                 #血量上限
             self.hp = max_hp                                     #当前血量
             self.armor = armor                                   #当前护甲
+            self.armor_level = 0                                 #护甲等级
+            self.cached_armor_resistance = {}                    #护甲抗性缓存器
+            self.cached_armor_really_rate = {}                   #护甲真实抗性缓存器
+            self.cached_armor_to_body = {}                       #护甲防护后对伤害的减伤比例缓存器
+            self.cached_body_part_resistance = {}                #身体部位抗性缓存器
             self.armor_durability_max = armor_durability_max     #护甲上限
-            self.low_armor = 0                                   #护甲下限
+            self.armor_durability = armor_durability_max         #护甲当前耐久
             self.owner_type = owner_type                         #目标
             self.source_type = source_type                       #来源
             self.events = []                                     #事件
@@ -232,21 +237,35 @@ class Combat:             #战斗系统
         def _init_body_parts(self,config):
             for part in config:
                 body_part = {
-                    "name":part["name"],
-                    "hp_max":part["hp_max"],
-                    "hp":part["hp_max"],
-                    "resistance":dict(part["resistance"]),
+                    "name":part["name"],                                       #部位名字
+                    "hp_max":part["hp_max"],                                   #最大血量
+                    "hp":part["hp_max"],                                       #当前血量
+                    "resistance":dict(part["resistance"]),                     #抗性值
                 }
                 self.body_part_list.append(body_part)
         def _init_amor_parts(self,config):
             for part in config:
                 armor_part = {
-                    "name":part["name"],
-                    "armor_level":part["armor_level"],
-                    "durability_lose_speed":part["durability_lose_speed"],      #护甲耐久受到伤害后的消耗速度比率
-                    "durability_max":part["durability_max"],
-                    "durability":part["durability_max"],
-                    "resistance":dict(part["resistance"]),
+                    "name":part["name"],                                               #部位名字
+                    "armor_level":part["armor_level"],                                 #护甲等级
+                    "armor_resistance_really":{
+                        int(armor_level):{
+                            int(harm_level):rate
+                            for harm_level,rate in harm_rates.items()                  #获取护甲真实抗性比例
+                        }
+                        for armor_level,harm_rates in part["armor_resistance_rate"].items()
+                    },
+                    "armor_resistance_to_body":{
+                        int(armor_level):{
+                            int(harm_level):rate
+                            for harm_level,rate in harm_rates.items()                  #获取护甲部位对身体减伤
+                        }
+                        for armor_level,harm_rates in part["armor_resistance_to_body"].items()
+                    },
+                    "durability_lose_speed":part["durability_lose_speed"],             #护甲耐久受到伤害后的消耗速度比率
+                    "durability_max":part["durability_max"],                           #最大耐久
+                    "durability":part["durability_max"],                               #初始耐久
+                    "resistance":dict(part["resistance"]),                             #抗性值
                 }
                 self.armor_part_list.append(armor_part)
         def _get_current_armor(self,harm_part):             #获取当前护甲部位
@@ -255,32 +274,80 @@ class Combat:             #战斗系统
                     return part
             return None
         def _get_armor_resistance(self,harm_part,damage_type):        #获取当前护甲部位抗性
+            cache_key = f"{harm_part}_{damage_type}"
+            if cache_key in self.cached_armor_resistance:
+                return self.cached_armor_resistance[cache_key]
             armor = self._get_current_armor(harm_part)
             if armor is None:
                 return 0
             resistance_value = armor["resistance"].get(damage_type,0)
+            self.cached_armor_resistance[cache_key] = resistance_value
             return resistance_value
-        def _armor_restrain(self,harm,harm_part):                     #计算护甲免伤后的伤害
+        def _get_armor_resistance_really_rate(self,harm_part,armor_level,harm_level):  #获取真实部位护甲减伤比例
+            cache_key = f"{harm_part}_{armor_level}_{harm_level}"                      #定义键名
+            if cache_key in self.cached_armor_really_rate:
+                return self.cached_armor_really_rate[cache_key]                        #假如存在，调用类缓存
+            armor = self._get_current_armor(harm_part)                                 #不存在，访问配置
+            if armor is None:
+                return 0.0
+            rate_dict = armor["armor_resistance_really"].get(armor_level,{})           #获取对应等级的伤害等级对照减伤字典
+            rate = rate_dict.get(harm_level,0.0)                                       #获取对应比例
+            self.cached_armor_really_rate[cache_key] = rate                            #存储对应部位减伤
+            return rate
+        def _get_armor_resistance_to_body(self,harm_part,armor_level,harm_level):      #护甲减伤后对身体伤害时的抗性
+            cache_key = f"{harm_part}_{armor_level}_{harm_level}"
+            if cache_key in self.cached_armor_to_body:
+                return self.cached_armor_to_body[cache_key]
             armor = self._get_current_armor(harm_part)
             if armor is None:
-                return harm
-            pass
+                return 0.0
+            armor_to_body_dict = armor["armor_resistance_to_body"].get(armor_level,{})
+            armor_to_body = armor_to_body_dict.get(harm_level,0.0)
+            self.cached_armor_to_body[cache_key] = armor_to_body
+            return armor_to_body
+        def _armor_lose_durability(self,armor_harm,harm_part,damage_type,armor_level,harm_level):       #计算护甲耐久受到的的伤害
+            cache_key_resistance = f"{harm_part}_{damage_type}"
+            cache_key_rate = f"{harm_part}_{armor_level}_{harm_level}"
+            armor = self._get_current_armor(harm_part)
+            if armor is None:
+                return armor_harm
+            base_resistance = self.cached_armor_resistance.get(cache_key_resistance,0)
+            really_rate = self.cached_armor_really_rate.get(cache_key_rate,0)
+            armor_damage = armor_harm * ((base_resistance + 1) * (really_rate + 1))
+            self.armor_durability = max(0,self.armor_durability - armor_damage)            #!!!这里需要修改！
+            """事件触发"""
+            #护甲归零事件
+            if self.armor_durability <= 0:
+                self.core.Event.emit("armor_broken",{
+                    "armor_part": harm_part,
+                    "owner": self.owner_type,
+                })
+            return armor_damage
+        def _after_armor_to_body_harm(self,body_harm,harm_part,armor_level,harm_level):                  #护甲减伤后对身体的伤害
+            armor = self._get_current_armor(harm_part)
+            if armor is None:
+                return body_harm
+            armor_to_body = self._get_armor_resistance_to_body(harm_part,armor_level,harm_level)
+            new_body_harm = body_harm * (armor_to_body + 1)
+            return new_body_harm
         def _get_current_body_part(self,harm_part):         #获取当前身体部位
             for part in self.body_part_list:
                 if part["name"] == harm_part:
                     return part
             return None
         def _get_body_resistance(self,harm_part,damage_type):         #获取当前身体部位抗性
+            cache_key = f"{harm_part}_{damage_type}"
+            if cache_key in self.cached_body_part_resistance:
+                return self.cached_body_part_resistance[cache_key]
             body_part = self._get_current_body_part(harm_part)
             if body_part is None:
                 return 0
             resistance_value = body_part["resistance"].get(damage_type,0)
+            self.cached_body_part_resistance[cache_key] = resistance_value
             return resistance_value
         def _body_restrain(self,harm):                      #计算身体免伤后的伤害
             pass
         def _subtraction_armor(self,harm):                  #护甲损失上限方法
-            pass
-        def _armor_lose_durability(self,harm):              #护甲损失耐久方法
             pass
         def _subtraction_body_hp(self,harm):                #生命值损失上限方法
             pass
