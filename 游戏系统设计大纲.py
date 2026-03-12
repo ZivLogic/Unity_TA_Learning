@@ -1,8 +1,50 @@
 import time
+import asyncio
 
 class Core:               #核心系统
     class Event:          #事件系统
-        pass
+        def __init__(self):
+            self.listeners = {}                     #事件名 -> 回调函数列表
+            self.logic_queue = []                   #逻辑队列，处理逻辑事件优先级
+            self.render_queue = []                  #渲染队列，处理渲染事件优先级
+            self.event_log = []                     #事件日志
+        def _on(self,event_name,callback):                          #订阅事件
+            if event_name not in self.listeners:
+                self.listeners[event_name] = []                     #定义键名
+            self.listeners[event_name].append(callback)             #订阅者
+        def _off(self,event_name,callback=None):                    #取消订阅
+            if callback is None:
+                self.listeners.pop(event_name,None)                 #订阅者为空，删除事件键名
+            else:
+                if event_name in self.listeners:                    #多个订阅者，删除指定订阅者
+                    self.listeners[event_name].remove(callback)
+        def emit_logic(self,event_name,date=None):                  #逻辑事件
+            self.logic_queue.append((event_name,date))
+        def emit_render(self,event_name,date=None):                 #渲染事件
+            self.render_queue.append((event_name,date))
+        async def _dispatch(self,event_name,date):                  #派送事件
+            if event_name not in self.listeners:                    #无事件则返回
+                return
+            for callback in self.listeners[event_name]:             #有事件则判断
+                if asyncio.iscoroutinefunction(callback):           #iscuroutinefunction为判断是否为携程函数！如果事件对应函数为协程，则传输协程方法值
+                    await callback(date)
+                else:
+                    callback(date)                                  #如果不是协程函数，传输普通值
+        async def process_logic(self):                              #逻辑事件处理优先级判断
+            while self.logic_queue:
+                event_name,date = self.logic_queue.pop(0)           #调取第一个事件同时删除第一个事件
+                await self._dispatch(event_name,date)
+        async def process_render(self):                             #渲染事件处理优先级判断
+            while self.render_queue:
+                event_name,date = self.render_queue.pop(0)
+                await self._dispatch(event_name,date)
+                await asyncio.sleep(0.016)                          #控制帧率为60帧
+        async def _main_event(self):                                #事件同时发布方法
+            while True:
+                await asyncio.gather(
+                    self.process_logic(),
+                    self.process_render(),
+                )
     class Time:           #时间系统
         pass
     class Config:         #配置系统
@@ -221,7 +263,7 @@ class Combat:             #战斗系统
             self.cached_armor_to_body = {}                       #护甲防护后对伤害的减伤比例缓存器
             self.cached_body_part_resistance = {}                #身体部位抗性缓存器
             self.armor_durability_max = armor_durability_max     #护甲上限
-            self.armor_durability = armor_durability_max         #护甲当前耐久
+            self.cached_armor_durability = {}                    #护甲当前耐久缓存
             self.owner_type = owner_type                         #目标
             self.source_type = source_type                       #来源
             self.events = []                                     #事件
@@ -249,18 +291,12 @@ class Combat:             #战斗系统
                     "name":part["name"],                                               #部位名字
                     "armor_level":part["armor_level"],                                 #护甲等级
                     "armor_resistance_really":{
-                        int(armor_level):{
-                            int(harm_level):rate
-                            for harm_level,rate in harm_rates.items()                  #获取护甲真实抗性比例
-                        }
-                        for armor_level,harm_rates in part["armor_resistance_rate"].items()
+                        int(harm_level):rate
+                        for harm_level,rate in part["armor_resistance_rate"].items()                  #获取护甲真实抗性比例
                     },
                     "armor_resistance_to_body":{
-                        int(armor_level):{
-                            int(harm_level):rate
-                            for harm_level,rate in harm_rates.items()                  #获取护甲部位对身体减伤
-                        }
-                        for armor_level,harm_rates in part["armor_resistance_to_body"].items()
+                        int(harm_level):rate
+                        for harm_level,rate in part["armor_resistance_to_body"].items()               #获取护甲部位对身体减伤
                     },
                     "durability_lose_speed":part["durability_lose_speed"],             #护甲耐久受到伤害后的消耗速度比率
                     "durability_max":part["durability_max"],                           #最大耐久
@@ -290,8 +326,7 @@ class Combat:             #战斗系统
             armor = self._get_current_armor(harm_part)                                 #不存在，访问配置
             if armor is None:
                 return 0.0
-            rate_dict = armor["armor_resistance_really"].get(armor_level,{})           #获取对应等级的伤害等级对照减伤字典
-            rate = rate_dict.get(harm_level,0.0)                                       #获取对应比例
+            rate = armor["armor_resistance_really"].get(harm_level,0.0)                #获取对应比例
             self.cached_armor_really_rate[cache_key] = rate                            #存储对应部位减伤
             return rate
         def _get_armor_resistance_to_body(self,harm_part,armor_level,harm_level):      #护甲减伤后对身体伤害时的抗性
@@ -301,8 +336,7 @@ class Combat:             #战斗系统
             armor = self._get_current_armor(harm_part)
             if armor is None:
                 return 0.0
-            armor_to_body_dict = armor["armor_resistance_to_body"].get(armor_level,{})
-            armor_to_body = armor_to_body_dict.get(harm_level,0.0)
+            armor_to_body = armor["armor_resistance_to_body"].get(harm_level,0.0)
             self.cached_armor_to_body[cache_key] = armor_to_body
             return armor_to_body
         def _armor_lose_durability(self,armor_harm,harm_part,damage_type,armor_level,harm_level):       #计算护甲耐久受到的的伤害
@@ -314,10 +348,11 @@ class Combat:             #战斗系统
             base_resistance = self.cached_armor_resistance.get(cache_key_resistance,0)
             really_rate = self.cached_armor_really_rate.get(cache_key_rate,0)
             armor_damage = armor_harm * ((base_resistance + 1) * (really_rate + 1))
-            self.armor_durability = max(0,self.armor_durability - armor_damage)            #!!!这里需要修改！
+            armor["durability"] = max(0,armor["durability"] - armor_damage)
+            self.cached_armor_durability[f"{harm_part}_{armor_level}"] = armor_damage
             """事件触发"""
             #护甲归零事件
-            if self.armor_durability <= 0:
+            if armor["durability"] <= 0:
                 self.core.Event.emit("armor_broken",{
                     "armor_part": harm_part,
                     "owner": self.owner_type,
