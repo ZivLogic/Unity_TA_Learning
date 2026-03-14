@@ -7,12 +7,14 @@ class Core:               #核心系统
             self.listeners = {}                     #事件名 -> 回调函数列表
             self.logic_queue = []                   #逻辑队列，处理逻辑事件优先级
             self.render_queue = []                  #渲染队列，处理渲染事件优先级
+            self.physics_queue = []                 #物理队列，处理物理事件优先级
+            self.audio_queue = []                   #音频队列，处理音频事件优先级
             self.event_log = []                     #事件日志
-        def _on(self,event_name,callback):                          #订阅事件
+        def on(self,event_name,callback):                          #订阅事件
             if event_name not in self.listeners:
                 self.listeners[event_name] = []                     #定义键名
             self.listeners[event_name].append(callback)             #订阅者
-        def _off(self,event_name,callback=None):                    #取消订阅
+        def off(self,event_name,callback=None):                     #取消订阅
             if callback is None:
                 self.listeners.pop(event_name,None)                 #订阅者为空，删除事件键名
             else:
@@ -22,6 +24,10 @@ class Core:               #核心系统
             self.logic_queue.append((event_name,date))
         def emit_render(self,event_name,date=None):                 #渲染事件
             self.render_queue.append((event_name,date))
+        def emit_physics(self,event_name,date=None):                #物理事件
+            self.physics_queue.append((event_name,date))
+        def emit_audio(self,event_name,date=None):                  #逻辑事件
+            self.audio_queue.append((event_name,date))
         async def _dispatch(self,event_name,date):                  #派送事件
             if event_name not in self.listeners:                    #无事件则返回
                 return
@@ -39,11 +45,23 @@ class Core:               #核心系统
                 event_name,date = self.render_queue.pop(0)
                 await self._dispatch(event_name,date)
                 await asyncio.sleep(0.016)                          #控制帧率为60帧
+        async def process_physics(self):                            #物理事件处理优先级判断
+            while self.physics_queue:
+                event_name,date = self.physics_queue.pop(0)
+                await self._dispatch(event_name,date)
+                await asyncio.sleep(0.01)                           #控制帧率为100帧
+        async def process_audio(self):                              #音频事件处理优先级判断
+            while self.audio_queue:
+                event_name,date = self.audio_queue.pop(0)
+                await self._dispatch(event_name,date)
+                await asyncio.sleep(0.033)                          #控制帧率为30帧
         async def _main_event(self):                                #事件同时发布方法
             while True:
                 await asyncio.gather(
                     self.process_logic(),
                     self.process_render(),
+                    self.process_physics(),
+                    self.process_audio(),
                 )
     class Time:           #时间系统
         pass
@@ -119,12 +137,15 @@ class DevTools:           #开发工具
         pass
 class Combat:             #战斗系统
     class Harm:           #伤害系统
-        def __init__(self,core,harm_config=None):
+        def __init__(self,core,harm_config=None,level_mode="permanent"):
             self.core = core
+            core.Event.on("harm_raycast_ture",self._on_harm_raycast_ture)       #射线检测通过，伤害合法事件
             self.config = core.config
             self.motion_body_harm = 0               #动态身体伤害，类内储存
             self.motion_armor_harm = 0              #动态护甲伤害，类内储存
-            self.harm_level = 0                     #等级初始为零
+            self.level_mode = level_mode            #初始化时设定模式
+            self.harm_level = 0 if level_mode == "temporary" else 1     #临时等级初始为零,永久等级初始为一
+            self.permanent_level = None             #初始化永久等级
             self.level_buff = 1.0                   #等级增伤类内存储，初始值为1.0
             self.level_buff_dict = {}               #等级增伤字典
             self.harm_time = 0                      #伤害时间，类内储存
@@ -157,6 +178,17 @@ class Combat:             #战斗系统
                     "harm_type":dict(harm["harm_type"])                      #伤害类型，此处为字典
                 }
                 self.harm_list.append(harm)
+        def _on_harm_raycast_ture(self,data):                                #解包射线合法事件方法
+            pass
+        def _on_buff_change_mode(self,data):
+            new_mode = data.get("level_mode")
+            if new_mode in ["permanent","temporary"]:
+                self.level_mode = new_mode
+                if new_mode == "temporary":
+                    self.harm_level = 0
+                    self.level_start_time = time.time()
+                else:
+                    pass
         def _get_harm(self,harm_name):                                       #获取单次实例
             for harm in self.harm_list:
                 if harm["name"] == harm_name:
@@ -191,6 +223,16 @@ class Combat:             #战斗系统
             return self._get_harm_attr(harm_name,"harm_level_end_time")
         def _get_harm_level_lose_number(self,harm_name):
             return self._get_harm_attr(harm_name,"harm_level_lose_number")
+        def _get_current_level(self,harm_name):                 #获取当前等级
+            if self.level_mode == "permanent":
+                if self.permanent_level is not None:
+                    self.harm_level = self.permanent_level          #配置可设计当前伤害等
+                    return self.harm_level
+                else:
+                    self.harm_level = self._get_harm_level_max(harm_name)
+                    return self.harm_level
+            else:
+                return self._get_temp_level(harm_name)
         def _add_level(self,harm_name,level_event_number):                      #改变等级方法
             harm_level_max = self._get_harm_level_max(harm_name)
             old_level = self.harm_level
@@ -200,7 +242,7 @@ class Combat:             #战斗系统
             if self.harm_level != old_level:
                 self.level_buff = self.level_buff_dict.get(self.harm_level,1.0)
             self.level_start_time = time.time()      #重置计时
-        def _get_current_level(self,harm_name):                                 #获取当前等级
+        def _get_temp_level(self,harm_name):                                 #获取当前临时等级
             harm_level_time = self._get_harm_level_time(harm_name)
             if self.harm_level == 0:
                 return 0
@@ -242,9 +284,10 @@ class Combat:             #战斗系统
                 "body_harm":body_harm,
             }
             return result
-        def _start_heal(self,harm_name,target):     #治疗
+        def _start_heal(self,harm_name,target,harm_part):     #治疗，持续伤害事件
             self.target = target
             heal_value = self._get_body_harm_value(harm_name) * (-1)
+            damage_time = time.time()
             self.core.Event.emit_logic("heal_started",{
                 "target":target,
                 "heal_id":id(self),
@@ -252,16 +295,22 @@ class Combat:             #战斗系统
                 "heal_prep_time": self._get_harm_prep_time(harm_name),
                 "heal_persist_time": self._get_harm_persist_time(harm_name),
                 "heal_time_max": self._get_harm_time_max(harm_name),
+                "harm_part": harm_part,
             })
-        def _trigger_event(self,event_name,data=None):  #事件触发方法
-            event_data = {
-                "harm":self,
-                "event_name":event_name,
-                "data":data,
+            self.harm_log.append(f"{target}的{harm_name}在{damage_time}时受到治疗(持续伤害)")
+        def _harm_event(self,harm_name,target,harm_part):         #伤害事件
+            self.target = target
+            damage_time = time.time()
+            self.core.Event.emit_logic("harm_output",{
+                "harm_name":harm_name,
+                "target":target,
+                "current_level":self._get_current_level(harm_name),
+                "output_harm":self._output_harm(harm_name),
+                "harm_type":self._get_harm_type(harm_name),
+                "harm_part": harm_part,
                 "timestamp":time.time(),
-            }
-            self.core.Event.emit_logic(f"harm_{event_name}",event_data)
-            self.harm_log.append(f"事件触发：{event_name} - {data}")
+            })
+            self.harm_log.append(f"{target}的{harm_name}在{damage_time}时受到伤害(瞬时伤害)")
         def _get_log(self,last_n=None):          #获取日志，last_n表示只取最后几条
             if last_n:
                 return self.harm_log[-last_n:]
@@ -279,6 +328,7 @@ class Combat:             #战斗系统
     class HP:             #血量系统
         def __init__(self,core,max_hp,armor,armor_durability_max,body_part_config=None,armor_part_config=None,owner_type="character",source_type="name"):
             self.core = core
+            core.Event.on("harm_output",self._on_harm_output)    #订阅伤害输出事件
             self.config = core.config
             self.max_hp = max_hp                                 #血量上限
             self.hp = max_hp                                     #当前血量
@@ -296,7 +346,6 @@ class Combat:             #战斗系统
             self.cached_armor_durability = {}                    #护甲当前耐久缓存
             self.owner_type = owner_type                         #目标
             self.source_type = source_type                       #来源
-            self.events = []                                     #事件
             self.treat_log = []                                  #日志
             #身体部位初始化
             self.body_part_list = []
@@ -336,11 +385,25 @@ class Combat:             #战斗系统
                     "resistance":dict(part["resistance"]),                             #抗性值
                 }
                 self.armor_part_list.append(armor_part)
+        def _on_harm_output(self,data):                     #解包伤害输出事件方法
+            harm_part = data["harm_part"]
+            armor_harm = data["output_harm"].get("armor_harm",0)
+            body_harm = data["output_harm"].get("body_harm",0)
+            harm_level = data.get("current_level",0)
+            damage_type = data["damage_type"]
+            armor_level = self._get_amor_level(harm_part)
+            self._armor_lose_durability(armor_harm,harm_part,damage_type,harm_level,armor_level)
+            self._new_body_part_hp(body_harm,harm_part,damage_type,harm_level,armor_level)
         def _get_current_armor(self,harm_part):             #获取当前护甲部位
             for part in self.armor_part_list:
                 if part["name"] == harm_part:
                     return part
             return None
+        def _get_amor_level(self,harm_part):                #获取当前护甲等级
+            armor = self._get_current_armor(harm_part)
+            armor_level = armor["armor_level"]
+            self.armor_level = armor_level
+            return armor_level
         def _get_armor_resistance(self,harm_part,damage_type):        #获取当前护甲部位抗性
             cache_key = f"{harm_part}_{damage_type}"
             if cache_key in self.cached_armor_resistance:
@@ -371,7 +434,7 @@ class Combat:             #战斗系统
             armor_to_body = armor["armor_resistance_to_body"].get(harm_level,0.0)
             self.cached_armor_to_body[cache_key] = armor_to_body
             return armor_to_body
-        def _get_armor_resistance_to_body_type_rate(self,harm_part,armor_level,damage_type):
+        def _get_armor_resistance_to_body_type_rate(self,harm_part,armor_level,damage_type):    #护甲减伤的真实比例
             cache_key = f"{harm_part}_{armor_level}_{damage_type}"
             if cache_key in self.cached_armor_to_type:
                 return self.cached_armor_to_type[cache_key]
@@ -400,7 +463,7 @@ class Combat:             #战斗系统
                     "owner": self.owner_type,
                 })
             return armor_damage
-        def _subtraction_armor(self,harm):                  #护甲损失上限方法
+        def _subtraction_armor(self):                  #护甲损失上限方法
             pass
         def _after_armor_to_body_harm(self,body_harm,harm_part,armor_level,harm_level,damage_type):        #护甲减伤后对身体的伤害
             armor = self._get_current_armor(harm_part)
@@ -503,7 +566,47 @@ class Entity:             #实体系统
     class Interaction:    #交互系统
         pass
     class Position:       #定位系统
-        pass
+        def __init__(self,x=0, y=0,z=0):
+            self.x = x                           #横位置
+            self.y = y                           #纵位置
+            self.z = z                           #高位置
+            self.last_x = x                      #上一帧横位置
+            self.last_y = y                      #上一帧纵位置
+            self.last_z = z                      #上一帧高位置
+            self.velocity_x = 0                  #横速度
+            self.velocity_y = 0                  #纵速度
+            self.velocity_z = 0                  #高速度
+            self.last_update =time.time()        #上一帧时间
+            self.owner = None                    #目标
+        def _distance_to(self,other):                      #3D位置计算
+            dx = self.x - other.x
+            dy = self.y - other.y
+            dz = self.z - other.z
+            return (dx**2 + dy**2 + dz**2)**0.5
+        def _flat_distance_to(self,other):                 #2D位置计算
+            dx = self.x - other.x
+            dy = self.y - other.y
+            return (dx**2 + dy**2)**0.5
+        def _update(self,new_x,new_y,new_z):               #更新位置
+            self.last_x, self.last_y, self.last_z = self.x, self.y, self.z
+            self.x, self.y, self.z = new_x, new_y, new_z
+            now = time.time()
+            gap = now - self.last_update
+            if gap > 0:
+                self.velocity_x = (self.x - self.last_x) / gap
+                self.velocity_y = (self.y - self.last_y) / gap
+                self.velocity_z = (self.z - self.last_z) / gap
+            self.last_update = now
+        def _predict_position(self,delta_time):             #预测未来位置
+            future_x = self.x + delta_time * self.velocity_x
+            future_y = self.y + delta_time * self.velocity_y
+            future_z = self.z + delta_time * self.velocity_z
+            return future_x,future_y,future_z
+        def _get_movement_direction(self):                   #获取移动方向
+            speed = (self.velocity_x**2 + self.velocity_y**2 + self.velocity_z**2)**0.5
+            if speed == 0:
+                return 0,0,0
+            return self.velocity_x/speed, self.velocity_y/speed, self.velocity_z/speed
     class Owner:          #目标系统
         pass
     class Source:         #来源系统
