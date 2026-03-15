@@ -1,6 +1,9 @@
 import time
 import asyncio
 
+from pygame.math import Vector3
+
+
 class Core:               #核心系统
     class Event:          #事件系统
         def __init__(self):
@@ -563,6 +566,13 @@ class Combat:             #战斗系统
     class Skill:          #技能系统
         pass
 class Entity:             #实体系统
+    def __init__(self):
+        self.components = {}      #储存所有组件
+    def add_component(self,name,component):
+        self.components[name] = component
+        component.owner = self
+    def get_component(self,name):
+        return self.components.get(name)
     class Interaction:    #交互系统
         pass
     class Position:       #定位系统
@@ -611,11 +621,73 @@ class Entity:             #实体系统
         pass
     class Source:         #来源系统
         pass
+    class Identity:       #ID系统
+        pass
     class Physics:        #物理系统
         class Collider:   #碰撞体
             pass
-        class RigidBody:  #刚体
+        class Trigger:    #触发器，进入范围处理事件
             pass
+        class Area:       #区域，存储触发器
+            pass
+        class Collision:  #碰撞检测
+            pass
+        class RigidBody:  #刚体
+            def __init__(self,core,rigid_body_config=None):
+                self.core = core
+                self.config = core.config
+                #物理基础属性
+                self.mass = 1.0                                       #质量
+                self.volume = 0.1                                     #体积
+                self.density = self.mass / self.volume                #密度
+                #运动属性
+                self.velocity = Vector3(0,0,0)                        #速度
+                self.acceleration = Vector3(0,0,0)                    #加速度
+                self.max_speed = 100.0                                #最大速度
+                #表面属性
+                self.friction = 0.5                                   #摩擦系数
+                self.bounciness = 0.3                                 #弹性系数
+                self.roughness = 0.2                                  #粗糙度
+                #力学属性
+                self.gravity_scale = 1.0                              #重力影响倍数
+                self.air_resistance = 0.01                            #空气阻力
+                self.torque = 0.0                                     #扭矩（旋转力）
+                #状态标记
+                self.is_static = False                                #是否静态
+                self.is_kinematic = False                             #是否运动学
+                self.is_sleeping = False                              #是否休眠
+                #初始化数据
+                if rigid_body_config is not None:
+                    self._init_rigid_body_from_config(rigid_body_config)
+            def _init_rigid_body_from_config(self,config):            #初始化方法
+                self.rigid_body_list = []                             # 刚体缓存列表
+                for item in config:
+                    rigid_body = {
+                        "name" : item["name"],
+                        "mass" : item["mass"],
+                        "friction" : item["friction"],
+                        "bounciness" : item["bounciness"],
+                        "roughness" : item["roughness"],
+                        "gravity_scale" : item["gravity_scale"],
+                        "air_resistance" : item["air_resistance"],
+                        "torque" : item["torque"],
+                        "is_static" : item["is_static"],
+                        "is_kinematic" : item["is_kinematic"],
+                    }
+                    self.rigid_body_list.append(rigid_body)
+                    self._renew_rigid_body()
+            def _renew_rigid_body(self):                              #更新类内配置
+                if self.rigid_body_list:
+                    data = self.rigid_body_list[0]
+                    self.mass = data.get("mass",self.mass)
+                    self.friction = data.get("friction",self.friction)
+                    self.bounciness = data.get("bounciness",self.bounciness)
+                    self.roughness = data.get("roughness",self.roughness)
+                    self.gravity_scale = data.get("gravity_scale",self.gravity_scale)
+                    self.air_resistance = data.get("air_resistance",self.air_resistance)
+                    self.torque = data.get("torque",self.torque)
+                    self.is_static = data.get("is_static",self.is_static)
+                    self.is_kinematic = data.get("is_kinematic",self.is_kinematic)
         class SoftBody:   #软体
             pass
         class Cloth:      #布料
@@ -629,8 +701,6 @@ class Entity:             #实体系统
         class Grenade:    #手雷，抛物线
             pass
         class AOE:        #范围攻击
-            pass
-        class Collision:  #碰撞矩阵
             pass
         class Movement:   #移动系统
             pass
@@ -686,4 +756,6 @@ class Picture:            #画面系统
 class Audio:              #音频系统
     pass
 class Save:               #存档系统
+    pass
+if __name__ == '__main__':
     pass
