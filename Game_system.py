@@ -1,5 +1,7 @@
 import time
 import asyncio
+import random
+import math
 
 from pygame.math import Vector3
 
@@ -731,9 +733,134 @@ class Entity:             #实体系统
                 impulse = -(1 + self.bounciness) * relative_vel.dot(normal)
                 self.velocity += impulse * normal / self.mass
         class SoftBody:   #软体
-            pass
-        class Cloth:      #布料
-            pass
+            def __init__(self,core,soft_body_config=None):
+                self.core = core
+                self.core.Event.on("apply_force_to_softbody",self._on_apply_force)
+                #顶点数据(获取模型时导入)
+                self.vertices = []       #所有顶点[{pos:Vector3,vel:Vector3,mass:float}]
+                self.edges = []          #顶点连接关系[(v1,v2,rest_length)]
+                #物理属性
+                self.stiffness = 0.5     #刚度(抵抗变形的能力)
+                self.damping = 0.1       #阻尼(振动衰减)
+                self.pressure = 1.0      #内部压力(气球)
+                #碰撞属性
+                self.friction = 0.3
+                self.bounciness = 0.2
+                #初始化方法
+                if soft_body_config is not None:
+                    self._init_form_config(soft_body_config)
+            def _init_form_config(self,config):         #获取配置，更新类属性
+                self.stiffness = config.get("stiffness",self.stiffness)
+                self.damping = config.get("damping",self.damping)
+                #顶点和边从模型文件加载
+                self.vertices = config.get("vertices",[])
+                self.edges = config.get("edges",[])
+            def _update(self,delta_time):
+                #应用内部力(弹簧力)
+                self._apply_spring_forces()
+                #应用外部力(重力，风力)
+                self._apply_external_forces(delta_time)
+                for V in self.vertices:
+                    V["vel"] += V["acc"] * delta_time     #速度等于加速度乘时间
+                    V["pos"] += V["vel"] * delta_time     #距离等于速度乘时间
+                    V["acc"] = Vector3(0,0,0)             #重置加速度
+                #碰撞检测
+                pass
+            def _apply_spring_forces(self):       #弹簧力
+                for v1_idx,v2_idx,rest_len in self.edges:
+                    v1 = self.vertices[v1_idx]
+                    v2 = self.vertices[v2_idx]
+                    #计算当前距离
+                    diff = v2["pos"] - v1["pos"]     #形变距离
+                    current_len = diff.length()      #当前长度
+                    if current_len == 0:
+                        continue
+                    force_dir = diff.normalize()     #方向
+                    spring_force = -self.stiffness * (current_len - rest_len)   #胡克定律F = -K * (current - rest)  k是弹性系数，括号是形变距离
+                    #应用到两个顶点
+                    v1["acc"] += force_dir * spring_force / v1["mass"]          #加速度等于方向向量 * 速度 / 质量
+                    v2["acc"] -= force_dir * spring_force / v2["mass"]
+            def _on_apply_force(self,data):          #施加力到软体
+                force = data.get("force",Vector3(0,0,0))
+                point = data.get("point",None)    #作用点
+                if point:
+                    #局部受力，寻找附近顶点
+                    nearest = min(self.vertices, key=lambda v:(v["pos"] - point).length())
+                    nearest["acc"] += force / nearest["mass"]
+                else:
+                    #整体受力
+                    for v in self.vertices:
+                        v["acc"] += force / v["mass"]
+            def _apply_external_forces(self,delta_time):
+                pass
+        class Cloth(SoftBody):      #布料
+            def __init__(self,core,cloth_config=None):
+                super().__init__(core)
+                #布料特有属性
+                self.fold_resistance = 0.8     #抗折叠能力
+                self.wind_influence = 1.0      #风力影响
+                self.is_attached = True        #是否固定
+                self.attachment_points = []    #固定点
+                self.vertices = []
+                self.edges = []
+                if cloth_config is not None:
+                    self._init_cloth(cloth_config)
+            def _init_cloth(self,config):          #初始化布料网格
+                width = config.get("width",10)
+                height = config.get("height",10)
+                segments_u = config.get("segments_u",20)
+                segments_v = config.get("segments_v",20)
+                fixed_type = config.get("fixed_type","top")
+                #创建网格顶点
+                for u in range(segments_u):
+                    for v in range(segments_v):
+                        x = (u / segments_u - 0.5) * width
+                        y = (v / segments_v - 0.5) * height
+                        z = math.sin(u / segments_u * math.pi) * 2
+                        pos = Vector3(x,y,z)
+                        if fixed_type == "top":           #顶部固定
+                            fixed = (v == segments_v - 1)
+                        elif fixed_type == "bottom":      #底部固定
+                            fixed = (v == 0)
+                        elif fixed_type == "left":        #左边固定
+                            fixed = (u == 0)
+                        elif fixed_type == "right":       #右边固定
+                            fixed = (u == segments_u - 1)
+                        elif fixed_type == "none":        #不固定
+                            fixed = False
+                        else:
+                            fixed = False                 #默认不固定
+                        #其实还有一个四角固定，在做蹦床的时候可以加
+                        self.vertices.append({
+                            "pos":pos,
+                            "vel":Vector3(0,0,0),
+                            "mass":config.get("mass",0.1),
+                            "fixed":fixed,
+                        })
+                #创建网格边
+                for u in range(segments_u):
+                    for v in range(segments_v):
+                        idx = v * segments_u + u
+                        if u < segments_u - 1:
+                            self.edges.append((idx,idx+1,width/segments_u))
+                        if v < segments_v - 1:
+                            self.edges.append((idx,idx+segments_u,height/segments_v))
+                        if config.get("diagonal",False):
+                            if u < segments_u - 1 and v < segments_v - 1:
+                                diag_len = math.sqrt((width/segments_u)**2 + (height/segments_v)**2)
+                                self.edges.append((idx,idx+1,diag_len))
+            def _apply_external_forces(self,delta_time):           #布料特有受力
+                #重力
+                gravity = Vector3(0,-9.8,0) * delta_time
+                #风力（随机值）
+                wind = Vector3(
+                    random.uniform(-1,1),
+                    random.uniform(-0.3,0.3),
+                    random.uniform(-1,1)
+                ).normalize() * self.wind_influence * delta_time
+                for v in self.vertices:
+                    if not v.get("fixed",False):       #判断非固定点才移动
+                        v["vel"] += gravity + wind
         class Vehicle:    #载具
             pass
         class Raycast:    #射线检测
