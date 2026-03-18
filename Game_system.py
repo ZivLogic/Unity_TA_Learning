@@ -657,6 +657,8 @@ class Entity:             #实体系统
                 self.gravity_scale = 1.0                              #重力影响倍数
                 self.air_resistance = 0.01                            #空气阻力
                 self.torque = 0.0                                     #扭矩（旋转力）
+                self.moment_of_inertia = 1.0                          #转动惯量
+                self.angular_velocity = Vector3(0,0,0)                #方向
                 #状态标记
                 self.is_static = False                                #是否静态
                 self.is_kinematic = False                             #是否运动学
@@ -676,6 +678,8 @@ class Entity:             #实体系统
                         "gravity_scale" : item["gravity_scale"],
                         "air_resistance" : item["air_resistance"],
                         "torque" : item["torque"],
+                        "moment_of_inertia" : item["moment_of_inertia"],
+                        "angular_velocity" : item["angular_velocity"],
                         "is_static" : item["is_static"],
                         "is_kinematic" : item["is_kinematic"],
                     }
@@ -691,20 +695,26 @@ class Entity:             #实体系统
                     self.gravity_scale = data.get("gravity_scale",self.gravity_scale)
                     self.air_resistance = data.get("air_resistance",self.air_resistance)
                     self.torque = data.get("torque",self.torque)
+                    self.moment_of_inertia = data.get("moment_of_inertia",self.moment_of_inertia)
+                    self.angular_velocity = data.get("angular_velocity",self.angular_velocity)
                     self.is_static = data.get("is_static",self.is_static)
                     self.is_kinematic = data.get("is_kinematic",self.is_kinematic)
-            def _calculate_torque(self,force,length):                  #扭矩计算
-                self.torque = force * length            #这里默认力垂直于力臂，长度默认为力臂长度，实际计算要先计算出力的大小与方向，力臂等于作用点距离物体中心的距离
-                return force * length
+            def _calculate_torque(self,force,point,center):                  #扭矩计算
+                r = point - center            #力臂
+                self.torque = r.cross(force)  #扭矩 = 力臂 * 力
+                angular_accel = self.torque / self.moment_of_inertia     #角加速度
+                self.angular_velocity += angular_accel
+                return angular_accel
             def _on_apply_force(self,data):             #施加力方法
                 force = data.get("force",Vector3(0,0,0))
-                length = data.get("length",None)
+                point = data.get("point",None)
+                center = data.get("center",None)
                 #F = ma
                 acceleration = force/self.mass
                 self.velocity += acceleration
                 #计算扭矩
-                if length is not None:
-                    self.torque += self._calculate_torque(force,length)
+                if center is not None:
+                    self.torque += self._calculate_torque(force,center,point)
             def _on_change_property(self,data):        #改变属性事件接受方法
                 prop_name = data.get("property")
                 new_value = data.get("value")
@@ -743,6 +753,7 @@ class Entity:             #实体系统
                 self.stiffness = 0.5     #刚度(抵抗变形的能力)
                 self.damping = 0.1       #阻尼(振动衰减)
                 self.pressure = 1.0      #内部压力(气球)
+                self.target_volume = self._calculate_volume()    #体积目标
                 #碰撞属性
                 self.friction = 0.3
                 self.bounciness = 0.2
@@ -762,6 +773,7 @@ class Entity:             #实体系统
                 self._apply_external_forces(delta_time)
                 for V in self.vertices:
                     V["vel"] += V["acc"] * delta_time     #速度等于加速度乘时间
+                    V["vel"] *= (1 - self.damping)        #软体阻尼
                     V["pos"] += V["vel"] * delta_time     #距离等于速度乘时间
                     V["acc"] = Vector3(0,0,0)             #重置加速度
                 #碰撞检测
@@ -793,6 +805,22 @@ class Entity:             #实体系统
                         v["acc"] += force / v["mass"]
             def _apply_external_forces(self,delta_time):
                 pass
+            def _check_self_collision(self):          #软体自碰撞
+                for i,v1 in enumerate(self.vertices):
+                    for j,v2 in enumerate(self.vertices):
+                        if i >= j: continue
+                        dist = (v1["pos"] - v2["pos"]).length()
+                        if dist < 0.1:
+                            dir = (v1["pos"] - v2["pos"]).normalize()
+                            v1["pos"] += dir * 0.01
+                            v2["pos"] -= dir * 0.01
+            def _maintain_volume(self):                 #保持软体体积
+                current_vol = self._calculate_volume()
+                if current_vol < self.target_volume:
+                    for v in self.vertices:
+                        v["acc"] += v["pos"] * self.pressure
+            def _calculate_volume(self):                #当前体积目标
+                pass
         class Cloth(SoftBody):      #布料
             def __init__(self,core,cloth_config=None):
                 super().__init__(core)
@@ -803,6 +831,7 @@ class Entity:             #实体系统
                 self.attachment_points = []    #固定点
                 self.vertices = []
                 self.edges = []
+                self.thickness = 0.01
                 if cloth_config is not None:
                     self._init_cloth(cloth_config)
             def _init_cloth(self,config):          #初始化布料网格
@@ -811,6 +840,7 @@ class Entity:             #实体系统
                 segments_u = config.get("segments_u",20)
                 segments_v = config.get("segments_v",20)
                 fixed_type = config.get("fixed_type","top")
+                self.thickness = config.get("thickness",0.1)
                 #创建网格顶点
                 for u in range(segments_u):
                     for v in range(segments_v):
@@ -861,6 +891,15 @@ class Entity:             #实体系统
                 for v in self.vertices:
                     if not v.get("fixed",False):       #判断非固定点才移动
                         v["vel"] += gravity + wind
+            def _apply_fold_resistance(self):           #布料防折叠
+                for v_idx,v2_idx,rest_len in self.edges:
+                    #计算布料之间的角度
+                    angle = self._get_angle_between_faces(v_idx,v2_idx)
+                    if angle < 0.1:    #太平了
+                        #施加一个很小的力弹开
+                        pass
+            def _get_angle_between_faces(self,v_idx,v2_idx):     #获取布料折叠角度方法
+                pass
         class Vehicle:    #载具
             pass
         class Raycast:    #射线检测
