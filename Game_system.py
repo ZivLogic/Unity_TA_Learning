@@ -657,7 +657,7 @@ class Entity:             #实体系统
                 self.gravity_scale = 1.0                              #重力影响倍数
                 self.air_resistance = 0.01                            #空气阻力
                 self.torque = 0.0                                     #扭矩（旋转力）
-                self.moment_of_inertia = 1.0                          #转动惯量
+                self.moment_of_inertia = 1.0                          #转动惯量，扭矩在不同材质下的生效比值
                 self.angular_velocity = Vector3(0,0,0)                #方向
                 #状态标记
                 self.is_static = False                                #是否静态
@@ -699,11 +699,11 @@ class Entity:             #实体系统
                     self.angular_velocity = data.get("angular_velocity",self.angular_velocity)
                     self.is_static = data.get("is_static",self.is_static)
                     self.is_kinematic = data.get("is_kinematic",self.is_kinematic)
-            def _calculate_torque(self,force,point,center):                  #扭矩计算
+            def _apply_torque(self,force,point,center):                  #扭矩计算
                 r = point - center            #力臂
                 self.torque = r.cross(force)  #扭矩 = 力臂 * 力
                 angular_accel = self.torque / self.moment_of_inertia     #角加速度
-                self.angular_velocity += angular_accel
+                self.angular_velocity += angular_accel        #角加速度变化导致的角速度变化
                 return angular_accel
             def _on_apply_force(self,data):             #施加力方法
                 force = data.get("force",Vector3(0,0,0))
@@ -713,8 +713,8 @@ class Entity:             #实体系统
                 acceleration = force/self.mass
                 self.velocity += acceleration
                 #计算扭矩
-                if center is not None:
-                    self.torque += self._calculate_torque(force,center,point)
+                if point and center is not None:
+                    self._apply_torque(force,point,center)     #角加速度计算得出可以计算实际旋转多快
             def _on_change_property(self,data):        #改变属性事件接受方法
                 prop_name = data.get("property")
                 new_value = data.get("value")
@@ -732,7 +732,7 @@ class Entity:             #实体系统
                 if self.velocity.length() > self.max_speed:
                     self.velocity = self.velocity.normalize() * self.max_speed
                 #检查是否休眠
-                if self.velocity.length() < 0.01 and not self.is_sleeping:
+                if self.velocity.length() < 0.01 and not self.is_sleeping:       #速度是否小于0.01
                     self.is_sleeping = True
                     self.core.Event.emit_logic("rigidbody_sleep",{"body":self})
             def _on_collision(self,data):       #碰撞事件接收方程
@@ -753,7 +753,7 @@ class Entity:             #实体系统
                 self.stiffness = 0.5     #刚度(抵抗变形的能力)
                 self.damping = 0.1       #阻尼(振动衰减)
                 self.pressure = 1.0      #内部压力(气球)
-                self.target_volume = self._calculate_volume()    #体积目标
+                self.target_volume = self._calculate_volume()    #目标体积
                 #碰撞属性
                 self.friction = 0.3
                 self.bounciness = 0.2
@@ -777,7 +777,7 @@ class Entity:             #实体系统
                     V["pos"] += V["vel"] * delta_time     #距离等于速度乘时间
                     V["acc"] = Vector3(0,0,0)             #重置加速度
                 #碰撞检测
-                pass
+                self._check_self_collision()              #软体自碰撞
             def _apply_spring_forces(self):       #弹簧力
                 for v1_idx,v2_idx,rest_len in self.edges:
                     v1 = self.vertices[v1_idx]
@@ -808,19 +808,48 @@ class Entity:             #实体系统
             def _check_self_collision(self):          #软体自碰撞
                 for i,v1 in enumerate(self.vertices):
                     for j,v2 in enumerate(self.vertices):
-                        if i >= j: continue
-                        dist = (v1["pos"] - v2["pos"]).length()
+                        if i >= j: continue    #跳过此项
+                        dist = (v1["pos"] - v2["pos"]).length()      #两点之间的距离
                         if dist < 0.1:
                             dir = (v1["pos"] - v2["pos"]).normalize()
                             v1["pos"] += dir * 0.01
                             v2["pos"] -= dir * 0.01
             def _maintain_volume(self):                 #保持软体体积
                 current_vol = self._calculate_volume()
-                if current_vol < self.target_volume:
+                if current_vol < self.target_volume:        #当前体积小于目标体积，压力向外
+                    pressure_force = (self.target_volume - current_vol) / self.target_volume * self.pressure
                     for v in self.vertices:
-                        v["acc"] += v["pos"] * self.pressure
-            def _calculate_volume(self):                #当前体积目标
-                pass
+                        normal = self._get_vertex_normal(v)    #计算顶点法线
+                        v["acc"] += normal * pressure_force / v["mass"]
+                elif current_vol > self.target_volume:      #当前体积大于目标体积，压力向内
+                    pressure_force = (self.target_volume - current_vol) / self.target_volume * self.pressure
+                    for v in self.vertices:
+                        normal = self._get_vertex_normal(v)
+                        v["acc"] += normal * pressure_force / v["mass"]
+            def _calculate_volume(self):                #计算软体体积
+                #用包围盒计算（不精确）
+                min_x = min(v["pos"].x for v in self.vertices)
+                max_x = max(v["pos"].x for v in self.vertices)
+                min_y = min(v["pos"].y for v in self.vertices)
+                max_y = max(v["pos"].y for v in self.vertices)
+                min_z = min(v["pos"].z for v in self.vertices)
+                max_z = max(v["pos"].z for v in self.vertices)
+                return (max_x - min_x) * (max_y - min_y) * (max_z - min_z)
+            def _get_vertex_normal(self,v):        #获取法线方向
+                center = self._get_center()
+                return (v["pos"] - center).normalize()    #当前点与中心点之间的距离方向
+            def _get_center(self):                        #获取当前中心点
+                min_x = min(v["pos"].x for v in self.vertices)
+                max_x = max(v["pos"].x for v in self.vertices)
+                min_y = min(v["pos"].y for v in self.vertices)
+                max_y = max(v["pos"].y for v in self.vertices)
+                min_z = min(v["pos"].z for v in self.vertices)
+                max_z = max(v["pos"].z for v in self.vertices)
+                return Vector3(
+                    min_x + (max_x - min_x) / 2,
+                    min_y + (max_y - min_y) / 2,
+                    min_z + (max_z - min_z) / 2
+                )                                   #包围盒的中点
         class Cloth(SoftBody):      #布料
             def __init__(self,core,cloth_config=None):
                 super().__init__(core)
@@ -829,9 +858,7 @@ class Entity:             #实体系统
                 self.wind_influence = 1.0      #风力影响
                 self.is_attached = True        #是否固定
                 self.attachment_points = []    #固定点
-                self.vertices = []
-                self.edges = []
-                self.thickness = 0.01
+                self.thickness = 0.01          #网格厚度
                 if cloth_config is not None:
                     self._init_cloth(cloth_config)
             def _init_cloth(self,config):          #初始化布料网格
@@ -892,14 +919,84 @@ class Entity:             #实体系统
                     if not v.get("fixed",False):       #判断非固定点才移动
                         v["vel"] += gravity + wind
             def _apply_fold_resistance(self):           #布料防折叠
+                #建立缓存面信息
+                if not hasattr(self, "_face_cache"):
+                    self._build_face_cache()
                 for v_idx,v2_idx,rest_len in self.edges:
                     #计算布料之间的角度
                     angle = self._get_angle_between_faces(v_idx,v2_idx)
-                    if angle < 0.1:    #太平了
-                        #施加一个很小的力弹开
-                        pass
+                    if angle > math.pi - 0.3:       #接近180度
+                        faces = self._get_faces_around_edge(v_idx,v2_idx)
+                        if len(faces) >= 2:
+                            #施加一个很小的力弹开
+                            center1 = self._get_face_center(faces[0])     #获取中心点
+                            center2 = self._get_face_center(faces[1])
+                            #计算推开方向
+                            dir = (center1 - center2).normalize()
+                            #施加小力
+                            force_mag = (angle - (math.pi - 0.3)) * self.fold_resistance   #力的大小与角度有关
+                            force = dir * force_mag * 0.01
+                            for idx in [v_idx,v2_idx]:
+                                self.vertices[idx]["acc"] += force / self.vertices[idx]["mass"]
             def _get_angle_between_faces(self,v_idx,v2_idx):     #获取布料折叠角度方法
-                pass
+                #找到共享边的三角形
+                faces = self._get_faces_around_edge(v_idx,v2_idx)
+                if len(faces) < 2:
+                    return math.pi
+                #获取两面法线
+                normal1 = self._get_vertex_normal(faces[0])
+                normal2 = self._get_vertex_normal(faces[1])
+                #计算法线夹角
+                dot = normal1.dot(normal2)
+                angle = math.acos(max(-1,min(1,dot)))    #限制范围
+                return angle
+            def _get_faces_around_edge(self,v1_idx,v2_idx):       #获取相邻三角形
+                faces = []
+                #一条边在一个矩形内最多只能有两个三角形，我们只需寻找是否有与边两点有边关系，且该点相邻
+                for v3_idx in range(len(self.vertices)):
+                    #寻找第三点
+                    if v3_idx == v1_idx or v3_idx == v2_idx:     #点不重合
+                        continue
+                    #检查是否相连
+                    if self._is_edge(v1_idx,v3_idx) and self._is_edge(v2_idx,v3_idx):
+                        faces.append([v1_idx,v2_idx,v3_idx])
+                return faces
+            def _is_edge(self,a,b):                     #检查两点间是否有边
+                for edge in self.edges:
+                    if (edge[0] == a and edge[1] == b) or (edge[0] == b and edge[1] == a):
+                        return True
+                return False
+            def _get_faces_normal(self,face_vertices):                  #获取三角形法向量
+                v0 = self.vertices[face_vertices[0]]["pos"]
+                v1 = self.vertices[face_vertices[1]]["pos"]
+                v2 = self.vertices[face_vertices[2]]["pos"]
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                normal = edge1.cross(edge2)
+                if normal.length() > 0:
+                    normal = normal.normalize()
+                return normal
+            def _get_face_center(self,face_vertices):     #获取两面中心
+                v0 = self.vertices[face_vertices[0]]["pos"]
+                v1 = self.vertices[face_vertices[1]]["pos"]
+                v2 = self.vertices[face_vertices[2]]["pos"]
+                return (v0 + v1 + v2) / 3.0
+            def _build_face_cache(self):           #建立面缓存信息
+                self._face_cache = []
+                segments_u = int(len(self.vertices)**0.5)   #近似
+                for u in range(segments_u - 1):
+                    for v in range(segments_u - 1):
+                        #四个顶点
+                        i0 = v * segments_u + u
+                        i1 = v * segments_u + u + 1
+                        i2 = (v + 1) * segments_u + u
+                        i3 = (v + 1) * segments_u + u + 1
+                        #三角形一
+                        self._face_cache.append([i0,i1,i2])
+                        #三角形二
+                        self._face_cache.append([i0,i3,i2])
+        class SkinnedMesh:      #骨骼模型
+            pass
         class Vehicle:    #载具
             pass
         class Raycast:    #射线检测
